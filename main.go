@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-
+	"io/ioutil"
 	"fmt"
 	"github.com/pkg/term"
 	"io"
@@ -12,9 +12,10 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
-
+	"errors"
 	"strings"
 	"syscall"
+	"unsafe"
 
 )
 
@@ -26,6 +27,11 @@ type ParsedCommand struct {
 }
 
 var terminal *term.Term
+
+var processGroups []uint32
+
+var ForegroundPid uint32
+var ForegroundProcess error = errors.New("")
 
 var homedirRe *regexp.Regexp = regexp.MustCompile("^~([a-zA-Z]*)?(/*)?")//set HomeDir pattern
 
@@ -51,6 +57,9 @@ func main() {
 	if u, err := user.Current(); err == nil {
 		SourceFile(u.HomeDir + "/.shrc")//Load Profile file of terminal
 	}
+	//Start Shell processing
+	clrscr()
+	fmt.Println("\n\n\t\t\tWelcome to PSM Shell\n\n\t\t\tAn Interactive Shell based on POSIX Standards\n\n\t\t\tDeveloped by Pavan Sanath Mandar\n\n\t\t\tVersion 2.0\n")
 	PrintPrompt()
 	r := bufio.NewReader(t)
 	var cmd Command
@@ -73,25 +82,38 @@ func main() {
 				PrintPrompt()
 			} else {
 				err := cmd.HandleCmd()
-				if err != nil {
+				if err == ForegroundProcess {
+					terminal.Wait(child,processGroups,ForegroundPid)
+				} else if err != nil {
 					fmt.Fprintf(os.Stderr, "%v\n", err)
 				}
 				PrintPrompt()
 			}
 			cmd = ""
-
+		case '\u2191':
+			PrintPrompt()
 		case '\u007f', '\u0008'://                 Handle Backspace and delete keys
 			if len(cmd) > 0 {
 				cmd = cmd[:len(cmd)-1]    // Delete last char
 				fmt.Printf("\u0008 \u0008")
 			}
 
+		case '\t':
+			err := cmd.Complete()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+			}
 		default:
 			fmt.Printf("%c", c)
 			cmd += Command(c)
 		}
 	}
 }//End of main
+
+func clrscr(){
+	cmdout,_ :=exec.Command("clear").Output()
+	fmt.Println(string(cmdout))
+}
 
 func (c Command) HandleCmd() error {
 	parsed := c.Tokenize()
@@ -136,14 +158,120 @@ func (c Command) HandleCmd() error {
 			return fmt.Errorf("Usage: set var value")
 		}
 		return os.Setenv(args[0], args[1])
+	case "&":
+		go background(parsed[1], args)
+		return nil
 
-	default:
+	case "about":
+		fmt.Println("\n\n\t\t\t\t\tPSMshell\n\n\t\t\t\t\t\t\tVersion 2.0\n\n\n\t\t\tShell Interpreter Designed and Implemented in Golang\n\n\n\t\t\tMain Features : \n\n\t\t\tFast and Quick Response due to Go code Optimization\n\n\t\t\tBackground Processing using Goroutines\n\n\t\t\tCommand and File name completion and suggesions\n\n\t\t\tBatch Procesing with the help of Pipes and Go routines\n\n\n\tConcieved and Developed by : -\n\n\tPavan Keshav L\n\tSanath P Holla\n\tMandar M Patil")
+		return nil
+	//default:
+		//cmdout,er :=exec.Command(parsed[0], args[0:]...).Output()
+		//fmt.Println(string(cmdout))
 
-		cmdout,er :=exec.Command(parsed[0], parsed[1:]...).Output()
-		fmt.Println(string(cmdout))
-
-		return er
+		//return er
 	}
+
+	var parsedtokens []Token = []Token{Token(parsed[0])}
+	for _, t := range args {
+		parsedtokens = append(parsedtokens, Token(t))
+	}
+	commands := ParseCommands(parsedtokens)
+
+	var cmds []*exec.Cmd
+	for i, c := range commands {
+		if len(c.Args) == 0 {
+			// This should have never happened, there is
+			// no command, but let's avoid panicing.
+			continue
+		}
+		newCmd := exec.Command(c.Args[0], c.Args[1:]...)
+		newCmd.Stderr = os.Stderr
+		cmds = append(cmds, newCmd)
+
+		// If there was an Stdin specified, use it.
+		if c.Stdin != "" {
+			// Open the file to convert it to an io.Reader
+			if f, err := os.Open(c.Stdin); err == nil {
+				newCmd.Stdin = f
+				defer f.Close()
+			}
+		} else {
+			// There was no Stdin specified, so
+			// connect it to the previous process in the
+			// pipeline if there is one, the first process
+			// still uses os.Stdin
+			if i > 0 {
+				pipe, err := cmds[i-1].StdoutPipe()
+				if err != nil {
+					continue
+				}
+				newCmd.Stdin = pipe
+			} else {
+				newCmd.Stdin = os.Stdin
+			}
+		}
+		// If there was a Stdout specified, use it.
+		if c.Stdout != "" {
+			// Create the file to convert it to an io.Reader
+			if f, err := os.Create(c.Stdout); err == nil {
+				newCmd.Stdout = f
+				defer f.Close()
+			}
+		} else {
+			// There was no Stdout specified, so
+			// connect it to the previous process in the
+			// unless it's the last command in the pipeline,
+			// which still uses os.Stdout
+			if i == len(commands)-1 {
+				newCmd.Stdout = os.Stdout
+			}
+		}
+	}
+
+	var pgrp uint32
+	sysProcAttr := &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+
+	for _, c := range cmds {
+		c.SysProcAttr = sysProcAttr
+		if err := c.Start(); err != nil {
+			return err
+		}
+		if sysProcAttr.Pgid == 0 {
+			sysProcAttr.Pgid, _ = syscall.Getpgid(c.Process.Pid)
+			pgrp = uint32(sysProcAttr.Pgid)
+			processGroups = append(processGroups, uint32(c.Process.Pid))
+		}
+	}
+
+	ForegroundPid = pgrp
+	//terminal.Restore()
+	_, _, err1 := syscall.RawSyscall(
+		syscall.SYS_IOCTL,
+		uintptr(0),
+		uintptr(syscall.TIOCSPGRP),
+		uintptr(unsafe.Pointer(&pgrp)),
+	)
+	// RawSyscall returns an int for the error, we need to compare
+	// to syscall.Errno(0) instead of nil
+	if err1 != syscall.Errno(0) {
+		return err1
+	}
+	return ForegroundProcess
+
+
+
+}
+
+func background(com string,arg []string) {
+	cmdout,_ :=exec.Command(com, arg[1:]...).Output()
+
+	ioutil.WriteFile("/mnt/c/GOHOME/background_output.txt",cmdout,0644)
+
+
+	//err=ioutil.WriteFile("/mnt/c/GOHOME/background_error.txt",er,0644)
 
 }
 
@@ -166,6 +294,60 @@ func PrintPrompt() {
 	} else {
 		fmt.Fprintf(os.Stderr, "\n%s> ",os.Getenv("PWD"))
 	}
+}
+
+func ParseCommands(tokens []Token) []ParsedCommand {
+	// Keep track of the current command being built
+	var currentCmd ParsedCommand
+	// Keep array of all commands that have been built, so we can create the
+	// pipeline
+	var allCommands []ParsedCommand
+	// Keep track of where this command started in parsed, so that we can build
+	// currentCommand.Args when we find a special token.
+	var lastCommandStart = 0
+	// Keep track of if we've found a special token such as < or >, so that
+	// we know if currentCmd.Args has already been populated.
+	var foundSpecial bool
+	var nextStdin, nextStdout bool
+	for i, t := range tokens {
+		if nextStdin {
+			currentCmd.Stdin = string(t)
+			nextStdin = false
+		}
+		if nextStdout {
+			currentCmd.Stdout = string(t)
+			nextStdout = false
+		}
+		if t.IsSpecial() || i == len(tokens)-1 {
+			if foundSpecial == false {
+				// Convert from Token to string
+				var slice []Token
+				if i == len(tokens)-1 {
+					slice = tokens[lastCommandStart:]
+				} else {
+					slice = tokens[lastCommandStart:i]
+				}
+
+				for _, t := range slice {
+					currentCmd.Args = append(currentCmd.Args, string(t))
+				}
+			}
+			foundSpecial = true
+		}
+		if t.IsStdinRedirect() {
+			nextStdin = true
+		}
+		if t.IsStdoutRedirect() {
+			nextStdout = true
+		}
+		if t.IsPipe() || i == len(tokens)-1 {
+			allCommands = append(allCommands, currentCmd)
+			lastCommandStart = i + 1
+			foundSpecial = false
+			currentCmd = ParsedCommand{}
+		}
+	}
+	return allCommands
 }
 
 //Setup Terminal Profile
