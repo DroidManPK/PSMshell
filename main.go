@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"io/ioutil"
+	//"io/ioutil"
 	"fmt"
 	"github.com/pkg/term"
 	"io"
@@ -84,9 +84,9 @@ func main() {
 				err := cmd.HandleCmd()
 				if err == ForegroundProcess {
 					terminal.Wait(child,processGroups,ForegroundPid)
-				} else if err != nil {
-					fmt.Fprintf(os.Stderr, "%v\n", err)
-				}
+				} //else if err != nil {
+					//fmt.Fprintf(os.Stderr, "", err)
+				//}
 				PrintPrompt()
 			}
 			cmd = ""
@@ -97,7 +97,14 @@ func main() {
 				cmd = cmd[:len(cmd)-1]    // Delete last char
 				fmt.Printf("\u0008 \u0008")
 			}
-
+		case '\u0004':
+			if len(cmd) == 0 {
+				os.Exit(0)
+			}
+			err := cmd.Complete()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+			}
 		case '\t':
 			err := cmd.Complete()
 			if err != nil {
@@ -159,7 +166,7 @@ func (c Command) HandleCmd() error {
 		}
 		return os.Setenv(args[0], args[1])
 	case "&":
-		go background(parsed[1], args)
+		background(c)
 		return nil
 
 	case "about":
@@ -247,7 +254,7 @@ func (c Command) HandleCmd() error {
 	}
 
 	ForegroundPid = pgrp
-	//terminal.Restore()
+	terminal.Restore()
 	_, _, err1 := syscall.RawSyscall(
 		syscall.SYS_IOCTL,
 		uintptr(0),
@@ -265,13 +272,16 @@ func (c Command) HandleCmd() error {
 
 }
 
-func background(com string,arg []string) {
-	cmdout,_ :=exec.Command(com, arg[1:]...).Output()
+func background(com Command) {
+	var done Command
+	done=Command("")
+	for i, chr := range com{
+		if(i>=2){done+=Command(chr)}
+		}
 
-	ioutil.WriteFile("/mnt/c/GOHOME/background_output.txt",cmdout,0644)
+	done+=Command(" >bg_op.txt")
 
-
-	//err=ioutil.WriteFile("/mnt/c/GOHOME/background_error.txt",er,0644)
+	go done.HandleCmd()
 
 }
 
